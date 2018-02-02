@@ -1,0 +1,520 @@
+#!/bin/bash
+##
+## lisotool - live (Linux) ISO tool
+##   Ben Fuhrmannek <bef@pentaphase.de> - 2018-01
+##
+##   license: Apache License, Version 2.0 - see LICENSE.txt for more information
+##
+
+liso_version=0.1
+
+DEBUG=${DEBUG:-1}
+IMAGE_NAME=${IMAGE_NAME:-LINUX}
+
+if [[ -t 1 ]]; then
+	HAVE_TTY=1
+	ANSI_RESET='\033[0m'
+	ANSI_FGRESET='\033[39m'
+	ANSI_FGRED='\033[31m'
+	ANSI_FGGREEN='\033[32m'
+	ANSI_FGYELLOW='\033[33m'
+	ANSI_FGMAGENTA='\033[35m'
+	ANSI_FGCYAN='\033[36m'
+	echo -en $ANSI_RESET ## reset ansi color
+else
+	HAVE_TTY=0
+	ANSI_RESET=''
+	ANSI_FGRESET=''
+	ANSI_FGRED=''
+	ANSI_FGGREEN=''
+	ANSI_FGYELLOW=''
+	ANSI_FGMAGENTA=''
+	ANSI_FGCYAN=''
+fi
+
+##
+
+function msg() {
+	local out_start=""
+	local out_end=""
+
+	if [[ $# -gt 1 ]]; then
+		out_end="$ANSI_FGRESET"
+		case "$1" in
+		c*) ## critical
+			out_start="$ANSI_FGMAGENTA[C] "
+			;;
+		e*) ## error
+			out_start="$ANSI_FGRED[E] "
+			;;
+		w*) ## warning
+			out_start="$ANSI_FGYELLOW[W] "
+			;;
+		n*) ## notice
+			out_start="$ANSI_FGCYAN[n] === "
+			out_end=" ===$ANSI_FGRESET"
+			;;
+		i*) ## info
+			out_start="$ANSI_FGGREEN[i] "
+			;;
+		d*) ## debug
+			if [[ $DEBUG -ne 1 ]]; then
+				return
+			fi
+			out_start="[d] "
+			;;
+		*)
+			out_start="[*] "
+			;;
+		esac
+		shift
+	fi
+	echo -en "$out_start"
+	echo -n "$@"
+	echo -e "$out_end"
+}
+
+function error_exit() {
+	msg error "$1"
+	msg info "good bye."
+	exit ${2:-1}
+}
+
+##
+
+function readinput() {
+	local opt
+	local varname default_value validator_func dontask=0
+	OPTIND=1
+	while getopts "v:d:f:n" opt; do
+		case "$opt" in
+			v) varname="$OPTARG" ;;
+			d) default_value="$OPTARG" ;;
+			f) validator_func="$OPTARG" ;;
+			n) dontask=1 ;;
+		esac
+	done
+	shift $((OPTIND-1))
+	local prompt="$1"
+
+	local input
+	if [[ -n "$varname" && -n "${!varname}" ]]; then
+		default_value="${!varname}"
+	fi
+
+	if [[ $HAVE_TTY -eq 1 ]]; then
+		while true; do
+			if [[ $dontask -eq 1 && -n "${!varname}" ]]; then
+				dontask=0
+				msg "${prompt} [${!varname}]"
+			else
+				read -er -p "[?] ${prompt} [$default_value] " input
+			fi
+
+			if [[ -z "$input" ]]; then
+				input="$default_value"
+			fi
+
+			if [[ -n "$validator_func" ]]; then
+				$validator_func "$input"
+				if [[ $? != 0 ]]; then
+					continue
+				fi
+			fi
+			break
+		done
+	else
+		## no tty -> fallback to default value
+		input="$default_value"
+	fi
+
+	if [[ -n "$varname" ]]; then
+		eval "$varname=\"\$input\""
+	else
+		REPLY="$input"
+	fi
+}
+
+function readinput_yesno() {
+	readinput -f validate_yesno "$@"
+	[[ "$REPLY" == "y" ]]
+}
+
+## validators
+
+function validate_yesno() {
+	case "$1" in
+		y|n) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+function validate_dir_empty() {
+	[[ ! -d "$1" || -z "$(ls -A "$1")" ]]
+}
+
+##
+
+function call() {
+	msg debug "calling: $@"
+	"$@"
+	ret=$?
+	if [[ $ret -ne 0 ]]; then
+		msg error ":( something went terribly wrong here."
+		return $ret
+	# else
+	# 	msg debug "call complete."
+	fi
+}
+
+function require_package() {
+	local check_binary="$1"
+	local package_name="$2"
+
+	if ! which $check_binary >/dev/null; then
+		msg warning "$check_binary not found"
+		if which apt-get >/dev/null; then
+			msg info "installing $package_name..."
+			call apt-get install $package_name
+		else
+			error_exit "please install $package_name manually"
+		fi
+	fi
+}
+
+function require_packages() {
+	require_package unsquashfs squashfs-tools
+	require_package genisoimage genisoimage
+	require_package rsync rsync
+}
+
+
+##
+
+function find_livesystem() {
+	local searchdir="$1"
+	local searchfn="$2"
+	local dir
+	REPLY=""
+
+	for dir in live casper; do
+		msg debug "  maybe $searchdir/$dir/$searchfn ?"
+		if [[ -f "$searchdir/$dir/$searchfn" ]]; then
+			REPLY="/$dir/$searchfn"
+			return 0
+		fi
+	done
+
+	cd "$searchdir"
+	REPLY="$(find . -name "$searchfn" | head -1)"
+	cd - >/dev/null
+	if [[ -n "$REPLY" ]]; then
+		REPLY="${REPLY:1}" ## remove leading .
+		return 0
+	fi
+	return 1
+}
+
+function do_unpack-iso() {
+	local isofile="$1"
+	local tmpdir="$2"
+	local mntdir="$tmpdir/mnt"
+	local extractdir="$tmpdir/extract-cd"
+	local livesystemfn="filesystem.squashfs"
+	local livesystem
+	local rootdir="$tmpdir/squashfs-root"
+
+	if [[ $# -ne 2 ]]; then
+		msg "usage:"
+		msg "  $0 unpack-iso <isofile> <tmpdir>"
+		msg "<isofile> examples:"
+		msg "  KaliLinux: https://archive.kali.org/kali-daily-images/"
+		return 1
+	fi
+
+	require_packages
+
+	if [[ ! -f "$isofile" || ! -r "$isofile" ]]; then
+		error_exit "iso file $isofile is not there or not readable."
+	fi
+
+	if [[ ! -d "$tmpdir" ]]; then
+		msg info "creating directory $tmpdir"
+		call mkdir "$tmpdir" || exit 1
+	else
+		if [[ -d "$mntdir" && -n "$(ls -A "$mntdir")" ]]; then
+			call mount
+			error_exit "directory $mntdir is not empty. possibly mounted?"
+		fi
+		if [[ -d $extractdir && -n "$(ls -A "$extractdir")" ]]; then
+			error_exit "directory $extractdir is not empty."
+		fi
+	fi
+
+	msg info "creating directory $mntdir"
+	call mkdir -p "$mntdir" || exit 1
+
+	msg info "mounting iso file $isofile to $mntdir"
+	call mount -o loop "$isofile" $mntdir || exit 1
+
+	msg info "searching for livesystem..."
+	if find_livesystem "$mntdir" "$livesystemfn"; then
+		livesystem="$REPLY"
+		msg info "found livesystem: $livesystem"
+	else
+		msg info "unmounting $mntdir"
+		call umount $mntdir
+		error_exit "cannot find livesystem file $livesystemfn"
+	fi
+
+	msg info "creating directory $extractdir"
+	call mkdir -p $extractdir || exit 1
+
+	msg info "syncing ISO files to $extractdir..."
+	call rsync --exclude=$livesystem -a $mntdir/ $extractdir || exit 1
+
+	livesystem="$mntdir$livesystem"
+	msg info "extracting livesystem $livesystem to $rootdir"
+	call unsquashfs -d $rootdir $livesystem || exit 1
+
+	msg info "unmounting $mntdir"
+	call umount $mntdir
+
+	msg "task completed. next steps:"
+	msg ""
+	msg "chroot for simple tasks like package installation, password changes:"
+	msg "  $0 chroot $rootdir"
+	msg "(don't forget 'xhost +' for X11 access from chroot with different users)"
+	msg ""
+	msg "or nspawn for starting servers"
+	msg "  $0 nspawn $rootdir"
+}
+
+function prepare_chroot() {
+	local rootdir="$1"
+	if [[ ! -f "$rootdir/etc/resolv.conf" ]]; then
+		msg info "using our /etc/resolv.conf for chroot"
+		call cp /etc/resolv.conf "$rootdir/etc/"
+	fi
+	if [[ ! -f "$rootdir/etc/hosts" ]]; then
+		msg info "using our /etc/hosts for chroot"
+		call cp /etc/hosts "$rootdir/etc/"
+	fi
+	msg info "mounting essentials"
+	call mount -o bind /run/ "$rootdir/run"
+	call mount --bind /dev/ "$rootdir/dev"
+	call chroot "$rootdir" mount -t proc none /proc
+	call chroot "$rootdir" mount -t sysfs none /sys
+	call chroot "$rootdir" mount -t devpts none /dev/pts
+
+	prepare_apt "$rootdir"
+}
+
+function do_cleanup-chroot() {
+	local rootdir="$1"
+
+	if [[ $# -ne 1 || -z "$1" || "$1" == "/" ]]; then
+		msg "usage:"
+		msg "  $0 cleanup-chroot <root dir>"
+		exit 1
+	fi
+
+	cleanup_livesystem "$rootdir"
+
+	call umount "$rootdir/dev/pts"
+	call umount "$rootdir/dev"
+	call umount "$rootdir/sys"
+	call umount "$rootdir/proc"
+	call umount "$rootdir/run"
+	msg notice "not touching /etc/resolv.conf and /etc/hosts. please make sure this is what you want."
+}
+
+function do_cleanup() {
+	local rootdir="$1"
+
+	if [[ $# -ne 1 || -z "$1" || "$1" == "/" ]]; then
+		msg "usage:"
+		msg "  $0 cleanup <root dir>"
+		exit 1
+	fi
+
+	cleanup_livesystem "$rootdir"
+}
+
+function prepare_apt() {
+	local rootdir="$1"
+	if [[ ! -d "$rootdir/etc/apt" ]]; then
+		return
+	fi
+	msg info "creating usable environment for apt"
+	if [[ -d "$rootdir/var/lib/dbus" ]]; then
+		call chroot "$rootdir" dbus-uuidgen >$rootdir/var/lib/dbus/machine-id
+	fi
+	call chroot "$rootdir" dpkg-divert --local --rename --add /sbin/initctl
+	call chroot "$rootdir" ln -s /bin/true /sbin/initctl
+}
+
+function cleanup_livesystem() {
+	local rootdir="$1"
+	if [[ ! -d "$rootdir/etc/apt" ]]; then
+		return
+	fi
+	msg info "cleanup..."
+	call chroot "$rootdir" apt-get clean
+	call rm -rf $rootdir/tmp/* $rootdir/root/.bash_history $rootdir/home/*/.bash_history $rootdir/var/lib/dbus/machine-id
+	call chroot "$rootdir" rm /sbin/initctl
+	call chroot "$rootdir" dpkg-divert --rename --remove /sbin/initctl
+}
+
+function do_chroot() {
+	local rootdir="$1"
+	if [[ $# -lt 1 ]]; then
+		msg "usage:"
+		msg "  $0 chroot <root dir> [command]"
+		return 1
+	fi
+
+	if validate_dir_empty "$rootdir/proc"; then
+		prepare_chroot "$rootdir"
+	fi
+
+	msg notice "entering chroot."
+	call chroot "$rootdir" "${@:2}"
+	msg notice "left chroot. welcome back."
+
+	msg info "please cleanup when you are done:"
+	msg info "  $0 cleanup-chroot $rootdir"
+}
+
+function do_nspawn() {
+	local rootdir="$1"
+	if [[ $# -lt 1 ]]; then
+		msg "usage:"
+		msg "  $0 nspawn <root dir>"
+		return 1
+	fi
+	require_package systemd-nspawn systemd-container
+
+	local machine="live$$"
+	msg info "spawning machine in '$rootdir' as '$machine'"
+	call systemd-nspawn -D "$rootdir" --boot --machine=live$$
+	msg notice "left nspawn. welcome back."
+}
+
+function do_pack-iso() {
+	local isofile="$1"
+	local tmpdir="$2"
+	local extractdir="$tmpdir/extract-cd"
+	local livesystemfn="filesystem.squashfs"
+	local livesystem
+	local livesystemdir
+	local rootdir="$tmpdir/squashfs-root"
+	local dir fn
+
+	if [[ $# -lt 1 ]]; then
+		msg "usage:"
+		msg "  $0 pack-iso <iso-file> <tmpdir> [extra args for mksquashfs]"
+		return 1
+	fi
+
+	for dir in $rootdir $extractdir; do
+		if [[ ! -d "$dir" ]]; then
+			error_exit "$tmpdir does not appear to be a valid tmpdir"
+		fi
+	done
+
+	msg info "searching for livesystem..."
+	if find_livesystem "$extractdir" "filesystem.size"; then
+		livesystemdir="$extractdir$(dirname $REPLY)"
+		livesystem="$livesystemdir/$livesystemfn"
+		msg info "found livesystem location: $livesystem"
+	else
+		error_exit "cannot find livesystem location :("
+	fi
+
+	if [[ -f "$livesystem" ]]; then
+		if readinput_yesno -d y "overwrite livesystem file $livesystem?"; then
+			rm "$livesystem"
+		fi
+	fi
+
+	if [[ ! -f "$livesystem" ]]; then
+		local mksquashfs=mksquashfs
+		if [[ -x "$rootdir/usr/bin/mksquashfs" ]]; then
+			msg info "using the livesystem's mksquashfs"
+			mksquashfs="$rootdir/usr/bin/mksquashfs"
+		else
+			msg warning "using the host system's mksquashfs, which may be incompatible"
+		fi
+		msg info "creating livesystem image..."
+		call $mksquashfs "$rootdir" "$livesystem" "${@:3}" || exit 1
+
+		msg info "recalculating filesystem size"
+		echo -n $(du -sx --block-size=1 "$rootdir" | cut -f1) >$livesystemdir/filesystem.size
+	fi
+
+	local manifestfile=""
+
+	for fn in filesystem.manifest filesystem.packages; do
+		if [[ -f "$livesystemdir/$fn" ]]; then
+			manifestfile="$livesystemdir/$fn"
+			break
+		fi
+	done
+	if [[ -n $manifestfile ]]; then
+		msg info "gathering installed packages"
+		chmod +w $manifestfile
+		chroot $rootdir dpkg-query -W --showformat='${Package} ${Version}\n' >$manifestfile
+	else
+		msg warning "manifest file not found. installer may not work properly."
+	fi
+
+	msg info "creating md5sum of all iso image files"
+	cd $extractdir
+	rm md5sum.txt
+	find -type f -print0 | xargs -0 md5sum | grep -v isolinux/boot.cat | tee md5sum.txt
+	cd - >/dev/null
+
+	if [[ -f "$isofile" ]]; then
+		if readinput_yesno -d y "overwrite iso file $isofile?"; then
+			rm "$isofile"
+		else
+			error_exit "aborted"
+		fi
+	fi
+
+	msg info "creating iso file $isofile"
+	call genisoimage -D -r -V "$IMAGE_NAME" -cache-inodes -J -l -b isolinux/isolinux.bin -c isolinux/boot.cat -no-emul-boot -boot-load-size 4 -boot-info-table -o $isofile $extractdir
+}
+
+##
+
+msg info "This is lisotool version $liso_version, written by Ben Fuhrmannek"
+msg info "    https://github.com/bef/lisotool"
+echo ""
+
+if [[ $# -ge 1 && "$(type -t "do_$1")" == "function" ]]; then
+	if [[ $UID -ne 0 ]]; then
+		if ! which sudo >/dev/null; then
+			error_exit "we need sudo! please install sudo or try again as root."
+		fi
+
+		msg notice "I need root access! Let's retry with sudo:"
+		sudo "$0" "$@"
+		exit $?
+	fi
+	msg info "$(date)"
+	msg debug "calling subcommand $1"
+	"do_$1" "${@:2}"
+else
+	msg "You have the following options:"
+	msg "  $0 unpack-iso <iso-file> <tmpdir>"
+	msg "  $0 chroot <root dir> [command]"
+	msg "  $0 cleanup-chroot <root dir>"
+	msg "  $0 nspawn <root dir>"
+	msg "  $0 cleanup <root dir>"
+	msg "  $0 pack-iso <iso-file> <tmpdir> [extra args for mksquashfs, e.g. -comp xz]"
+	msg ""
+fi
+
+msg info "bye."
